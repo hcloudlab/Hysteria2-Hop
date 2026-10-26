@@ -1,11 +1,11 @@
-# HCloudLab · 3X-UI Hysteria2 端口跳跃  V1 — Ubuntu 24.04
+# HCloudLab · 3X-UI Hysteria2 端口跳跃 — Ubuntu 24.04 / Debian 12、13
 
 ## 适用范围
 
 - 3X-UI 面板中的 Hysteria2 入站：数据库 `protocol=hysteria`
 - 在面板填写 **Hop Ports**，例如 `20000-30000`；脚本只读数据库，不修改 x-ui.db。
-- 只支持 Ubuntu 24.04 + systemd；IPv4，存在全局 IPv6 地址时也创建 IPv6 规则。
-- UFW 开启时自动添加跳跃范围 **和 Hysteria2 实际监听端口** 的 UDP 放行规则；nftables 未安装时从 Ubuntu 软件源自动安装。
+- 支持 Ubuntu 24.04、Debian 12/13 + systemd；IPv4，存在全局 IPv6 地址时也创建 IPv6 规则。
+- UFW 开启时自动添加跳跃范围 **和 Hysteria2 实际监听端口** 的 UDP 放行规则；nftables 未安装时通过系统 apt 软件源自动安装。
   - 这里说的是服务器自身的 UFW，不是 DMIT/其他云厂商控制台里的"安全组"。安全组仍需自己在面板放行跳跃范围和监听端口。
 - 本版本不保证与 Docker 或其他自定义 NAT 规则共存；检测到其他 DNAT/redirect 将安全拒绝安装。
 
@@ -59,3 +59,10 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/hcloudlab/Hysteria2
 - 跨 nftables/UFW/systemd 的自动回滚实现了尽力清理；断电、SIGKILL、外部系统同时修改规则等情况下，不能保证严格事务原子性。
 - 恢复不卸载 nftables 软件包，不修改 3X-UI 数据库。
 
+
+## Debian 适配状态
+
+- Debian 12（Bookworm）和 Debian 13（Trixie）已纳入系统版本检测；保持与 Ubuntu 24.04 相同的安装命令和管理接口。
+- Debian 默认可能没有安装或启用 UFW：脚本不会自行安装或启用 UFW。若主机使用其他防火墙策略，必须由管理员另外放行监听端口及跳跃端口范围。
+- 当前 Debian 支持属于待验收适配：必须在干净的 Debian 12/13 + 3X-UI 环境执行 install → status → update → restore、重启恢复和客户端 UDP 跳跃测试后，才能宣称实机验证通过。
+- 不支持的发行版或版本继续拒绝运行；不修改 3X-UI 数据库，不清空全局 nftables 规则。
