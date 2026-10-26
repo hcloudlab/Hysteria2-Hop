@@ -35,14 +35,29 @@ def run(cmd, check=True, input_text=None):
     return p
 
 
+def supported_os(os_release):
+    """Accept only explicitly supported distribution/version pairs."""
+    fields = {}
+    for line in os_release.splitlines():
+        if '=' not in line or line.lstrip().startswith('#'):
+            continue
+        key, value = line.split('=', 1)
+        fields[key] = value.strip().strip('"').strip("'")
+    return (fields.get('ID'), fields.get('VERSION_ID')) in {
+        ('ubuntu', '24.04'),
+        ('debian', '12'),
+        ('debian', '13'),
+    }
+
+
 def prerequisites():
     if os.geteuid():
         raise RuntimeError('需要 root 权限')
     if not Path('/run/systemd/system').exists():
         raise RuntimeError('需要 systemd')
     text = Path('/etc/os-release').read_text()
-    if not re.search(r'^ID=ubuntu$', text, re.M) or not re.search(r'^VERSION_ID="?24\.04"?$', text, re.M):
-        raise RuntimeError('V1 仅支持 Ubuntu 24.04')
+    if not supported_os(text):
+        raise RuntimeError('仅支持 Ubuntu 24.04、Debian 12/13（需要 systemd）')
     for command in ('systemctl', 'ss', 'ip', 'apt-get'):
         if not shutil.which(command):
             raise RuntimeError(f'缺少系统命令 {command}')
