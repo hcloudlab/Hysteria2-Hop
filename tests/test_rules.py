@@ -5,6 +5,8 @@ from unittest.mock import patch, Mock
 HY2HOP_PATH = Path(__file__).resolve().parent.parent / 'hy2hop.py'
 spec=importlib.util.spec_from_file_location('hy2hop_rules',HY2HOP_PATH)
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+# Never touch the real host from unit tests.
+m.setup_service = Mock(); m.other_firewall_hint = Mock(); m.legacy_nat_rules = lambda: []
 CFG={'id':5,'remark':'DMIT-Hy2-test','port':443,'start':20000,'end':30000}
 class RulesTests(unittest.TestCase):
  def test_dual_stack(self):
@@ -34,7 +36,7 @@ class RulesTests(unittest.TestCase):
   with patch.object(m.shutil,'which',return_value='/usr/sbin/nft'),patch.object(m,'run') as r:
    m.dependency();r.assert_not_called()
  def test_update_noop(self):
-  old={'config':CFG,'families':['ip'],'ufw_owned':['20000:30000/udp','443/udp']}
+  old={'config':CFG,'families':['ip'],'version':m.VERSION,'ufw_owned':['20000:30000/udp','443/udp']}
   with patch.object(m,'read_state',return_value=old),patch.object(m,'choose',return_value=CFG),patch.object(m,'listener'),patch.object(m,'dependency'),patch.object(m,'conflicts'),patch.object(m,'families',return_value=['ip']),patch.object(m,'apply') as a,patch.object(m,'ufw_add') as ua,patch.object(m,'write_state') as w:
    m.update();a.assert_not_called();ua.assert_not_called();w.assert_not_called()
  def test_install_rollback(self):

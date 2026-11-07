@@ -1,13 +1,34 @@
-# HCloudLab · 3X-UI Hysteria2 端口跳跃  V1 — Ubuntu 24.04
+# HCloudLab · 3X-UI Hysteria2 端口跳跃  V2 — Debian / Ubuntu
 
 ## 适用范围
 
+| 系统 | 版本 |
+| --- | --- |
+| Debian | 11 / 12 / 13 |
+| Ubuntu | 20.04 / 22.04 / 24.04 / 26.04 |
+
 - 3X-UI 面板中的 Hysteria2 入站：数据库 `protocol=hysteria`
 - 在面板填写 **Hop Ports**，例如 `20000-30000`；脚本只读数据库，不修改 x-ui.db。
-- 只支持 Ubuntu 24.04 + systemd；IPv4，存在全局 IPv6 地址时也创建 IPv6 规则。
-- UFW 开启时自动添加跳跃范围 **和 Hysteria2 实际监听端口** 的 UDP 放行规则；nftables 未安装时从 Ubuntu 软件源自动安装。
+- 需要 systemd、Python 3.8+（缺少时 `bootstrap.sh` 自动安装 `python3`）。其他 Debian/Ubuntu 版本或衍生版可设置 `HY2HOP_ALLOW_UNTESTED=1` 自行承担风险。
+- IPv4 必定创建规则；内核支持 IPv6 时同时创建 IPv6 规则（不再要求安装时已有公网 IPv6 地址）。
+- 只重定向**目的地是本机**的 UDP（`fib daddr type local`），不会误伤 Docker 容器、WireGuard 等经本机转发的流量。
+- UFW 开启时自动添加跳跃范围 **和 Hysteria2 实际监听端口** 的 UDP 放行规则；nftables 未安装时从系统软件源自动安装（Ubuntu 20.04 需启用 universe 源）。
   - 这里说的是服务器自身的 UFW，不是 DMIT/其他云厂商控制台里的"安全组"。安全组仍需自己在面板放行跳跃范围和监听端口。
-- 本版本不保证与 Docker 或其他自定义 NAT 规则共存；检测到其他 DNAT/redirect 将安全拒绝安装。
+  - 使用 firewalld 时脚本只提示、不修改，需要自行放行。
+- 可与 Docker 的 TCP 端口映射共存；只有**可能覆盖跳跃范围的 UDP** DNAT / redirect / TPROXY 规则（含 iptables-legacy）才会拒绝安装。
+- 不支持 OpenVZ / LXC 等不允许 nftables NAT 的容器型 VPS。
+
+## V2 更新
+
+- 适配 Debian 11/12/13、Ubuntu 20.04/22.04/24.04/26.04；兼容 nftables 0.9.3 ~ 1.1.x、Python 3.8 ~ 3.14。
+- 修复：Debian 用 `su`（不带 `-`）切 root 时找不到 `nft`/`ufw`；中文系统语言下 UFW 状态识别失败；`bootstrap.sh` 运行后临时目录残留。
+- NAT 规则只匹配本机目的地址，不再劫持经本机转发的流量。
+- Docker 主机不再被一刀切拒绝；冲突检测精确到 UDP 端口范围。
+- 其他入站的 Hop Ports 填错不再阻塞当前入站的安装/更新/状态检查。
+- 首次开机 apt 被 unattended-upgrades 占用时自动等待。
+- 系统大版本升级后，开机恢复规则不会因版本检查失败而导致节点掉线。
+- `update` 会自动升级已安装的脚本和 systemd 服务；V1 安装直接执行 `update` 即可升级，无需先 `restore`。
+- `status` 显示转发数据包计数；`restore` 同时清理 `/usr/local/sbin/hcloudlab-hy2hop`。
 
 ## 🎧 图文配置教程
 
@@ -37,7 +58,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/hcloudlab/Hysteria2
 
 ## 验收
 
-1. 首次安装：检查是否自动安装 nftables，读取 Hop Ports 并生成 IPv4/IPv6 映射，确认 UFW 同时放行了跳跃范围和实际监听端口（`ufw status numbered`）。
+1. 首次安装（Debian/Ubuntu 各版本）：检查是否自动安装 nftables，读取 Hop Ports 并生成 IPv4/IPv6 映射，确认 UFW 同时放行了跳跃范围和实际监听端口（`ufw status numbered`）。
 2. `sudo /usr/local/sbin/hcloudlab-hy2hop status`：检查当前配置；缺少监听端口或跳跃范围的任一条 UFW 规则都应报告 `STATUS: FAIL`。
 3. 更新客户端订阅，真实连接并确认跳跃端口的 UDP 流量计数增加。
 4. 连续执行 `update` 3 次，确保没有重复规则。
@@ -47,6 +68,17 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/hcloudlab/Hysteria2
 8. 出现错误立即停止并提供完整终端输出；不要手工执行 `nft flush ruleset` 或关闭 UFW。
 
 ## 内部验证范围
+
+### V2（2026-11）
+
+- 51 项单元测试在 Python 3.8 / 3.10 / 3.11 / 3.12 / 3.13 / 3.14 下全部通过。
+- 在 Ubuntu 20.04 / 22.04 / 24.04 / 26.04 的 debootstrap 根文件系统 + 隔离网络命名空间中，用真实的 `apt-get`/`nft`/`ufw`/`ss` 跑通 20 项端到端检查（每个版本均 20/20）：
+  自动安装 nftables、install、真实 UDP 包从跳跃端口转到监听端口并穿过 UFW、直连监听端口、经本机转发的流量不被重定向、status、update ×3 幂等、修改端口和范围后 update（旧 UFW 规则清理）、模拟开机 reload、Docker TCP 映射共存、范围内 UDP DNAT 拒绝、restore（保留原有 UFW 规则）。
+  - Ubuntu 20.04 覆盖 iptables-legacy 后端的 UFW + nftables 0.9.3 混用，以及 iptables-legacy 下的 Docker 规则检测。
+  - 测试时使用不含 `/usr/sbin` 的 PATH，复现 Debian `su` 环境。
+- **未验证**：Debian 11/12/13 未做真实系统测试（测试环境无法访问 Debian 软件源），仅覆盖其 os-release 识别以及同范围的 Python / nftables 版本；IPv6 转发未实测（测试内核无 IPv6）；systemd 用替身程序模拟，未做真实重启；未在 DMIT 等实机 + 真实 3X-UI + 真实客户端上复测。
+
+### V1
 
 - Python 语法检查与 31 项 mock/SQLite 自动化测试通过（新增跳跃范围 + 监听端口双 UFW 规则的安装/更新/恢复/状态检查/旧版本升级/失败回滚用例）。
 - 在隔离的 Ubuntu 24.04 容器中，用真实 `ss`/`nft`/`ufw`/`apt-get` 命令（非 mock）端到端跑通了完整的

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-"""HCloudLab HY2 Hop: Ubuntu 24.04, read-only 3X-UI, dedicated nft NAT."""
+"""HCloudLab HY2 Hop: Debian/Ubuntu, read-only 3X-UI, dedicated nft NAT table."""
+import sys
+
+if sys.version_info < (3, 8):
+    sys.stderr.write('ERROR: 需要 Python 3.8 或更高版本\n')
+    sys.exit(1)
+
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -8,10 +15,11 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import sys
 import tempfile
+import time
 from pathlib import Path
 
+VERSION = '2.0.0'
 DB = Path('/etc/x-ui/x-ui.db')
 BASE = Path('/var/lib/hcloudlab-hy2hop')
 STATE = BASE / 'state.json'
@@ -23,70 +31,142 @@ TABLE = 'hcloudlab_hy2hop'
 # 1777 sticky): /run/lock lets any local unprivileged user pre-create a
 # file at this predictable name and hold flock() on it indefinitely,
 # permanently denial-of-servicing every future install/update/status/
-# restore run (including root's) with "已有另一进程正在操作" - /run
-# itself is not world-writable, so only root can place a file here.
+# restore run (including root's) - only root can place a file in /run.
 LOCK = Path('/run/hcloudlab-hy2hop.lock')
+
+# Tested release matrix. Other Debian/Ubuntu releases need HY2HOP_ALLOW_UNTESTED=1.
+SUPPORTED = {
+    'debian': ('11', '12', '13'),
+    'ubuntu': ('20.04', '22.04', '24.04', '26.04'),
+}
+
+# Debian's `su` (without "-") drops /usr/sbin from PATH, which hides nft/ufw.
+os.environ['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:' + os.environ.get('PATH', '')
+# ufw/ss/apt output is translated under zh_CN etc.; parsing needs the C locale.
+CHILD_ENV = dict(os.environ, LC_ALL='C', LANG='C', LANGUAGE='C', DEBIAN_FRONTEND='noninteractive')
+NAT_WORDS = re.compile(r'\b(dnat|redirect|tproxy)\b', re.I)
 
 
 def run(cmd, check=True, input_text=None):
-    p = subprocess.run(cmd, input=input_text, text=True, capture_output=True)
+    p = subprocess.run(cmd, input=input_text, text=True, capture_output=True, env=CHILD_ENV)
     if check and p.returncode:
         raise RuntimeError(f"{' '.join(cmd)}: {p.stderr.strip() or p.stdout.strip()}")
     return p
 
 
-def prerequisites():
+def warn(msg):
+    print('WARN: ' + msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- environment
+
+def os_release(path=Path('/etc/os-release')):
+    data = {}
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition('=')
+        if sep and key.strip() and not key.startswith('#'):
+            data[key.strip()] = value.strip().strip('"').strip("'")
+    return data
+
+
+def check_os(info):
+    """Return a printable OS name; raise on unsupported systems."""
+    ident = info.get('ID', '')
+    version = info.get('VERSION_ID', '')
+    name = info.get('PRETTY_NAME') or f'{ident} {version}'
+    if version in SUPPORTED.get(ident, ()):
+        return name
+    family = {ident} | set(info.get('ID_LIKE', '').split())
+    if family & set(SUPPORTED) and os.environ.get('HY2HOP_ALLOW_UNTESTED') == '1':
+        warn(f'{name} 不在测试列表中，按 HY2HOP_ALLOW_UNTESTED=1 继续')
+        return name
+    supported = ', '.join(f'{k.capitalize()} {"/".join(v)}' for k, v in SUPPORTED.items())
+    raise RuntimeError(f'不支持的系统 {name}。支持：{supported}'
+                       '（其他 Debian/Ubuntu 衍生版可设置 HY2HOP_ALLOW_UNTESTED=1 自行承担风险）')
+
+
+def prerequisites(check_release=True):
     if os.geteuid():
         raise RuntimeError('需要 root 权限')
     if not Path('/run/systemd/system').exists():
         raise RuntimeError('需要 systemd')
-    text = Path('/etc/os-release').read_text()
-    if not re.search(r'^ID=ubuntu$', text, re.M) or not re.search(r'^VERSION_ID="?24\.04"?$', text, re.M):
-        raise RuntimeError('V1 仅支持 Ubuntu 24.04')
+    if check_release:
+        check_os(os_release())
     for command in ('systemctl', 'ss', 'ip', 'apt-get'):
         if not shutil.which(command):
             raise RuntimeError(f'缺少系统命令 {command}')
 
 
+def container_type():
+    p = run(['systemd-detect-virt', '-c'], False) if shutil.which('systemd-detect-virt') else None
+    kind = p.stdout.strip() if p and p.returncode == 0 else ''
+    return '' if kind in ('', 'none') else kind
+
+
+# ---------------------------------------------------------------- 3X-UI
+
+def parse_inbound(ident, port, raw, listen):
+    """Return (start, end, port) or raise ValueError with a readable reason."""
+    try:
+        data = json.loads(raw or '{}')
+        hop = data.get('finalmask', {}).get('quicParams', {}).get('udpHop', {}).get('ports')
+    except (TypeError, ValueError, AttributeError):
+        raise ValueError('stream_settings 无效') from None
+    if not hop:
+        return None
+    m = re.fullmatch(r'\s*(\d+)\s*-\s*(\d+)\s*', str(hop))
+    if not m:
+        raise ValueError(f'Hop Ports 格式错误（只支持 起始-结束，例如 20000-30000），当前为 {hop!r}')
+    a, b = map(int, m.groups())
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        raise ValueError('监听端口无效') from None
+    if not (1 <= a <= b <= 65535 and 1 <= port <= 65535):
+        raise ValueError('端口超出范围')
+    if a <= port <= b:
+        raise ValueError('Hop 范围包含监听端口')
+    if listen not in (None, '', '::', '0.0.0.0'):
+        raise ValueError('暂不支持绑定指定 IP')
+    return a, b, port
+
+
 def inbounds():
+    """Return (valid configs, {id: reason}) for enabled Hysteria2 inbounds with Hop Ports."""
     if not DB.is_file():
-        raise RuntimeError('未找到 3X-UI 数据库')
-    with sqlite3.connect(f'file:{DB}?mode=ro', uri=True) as con:
-        rows = con.execute("SELECT id,remark,port,enable,stream_settings,listen FROM inbounds WHERE protocol='hysteria' ORDER BY id").fetchall()
-    result = []
+        raise RuntimeError(f'未找到 3X-UI 数据库 {DB}')
+    with contextlib.closing(sqlite3.connect(f'file:{DB}?mode=ro', uri=True, timeout=10)) as con:
+        rows = con.execute("SELECT id,remark,port,enable,stream_settings,listen FROM inbounds "
+                           "WHERE protocol='hysteria' ORDER BY id").fetchall()
+    valid, invalid = [], {}
     for ident, remark, port, enabled, raw, listen in rows:
         if not enabled:
             continue
         try:
-            data = json.loads(raw or '{}')
-            hop = data.get('finalmask', {}).get('quicParams', {}).get('udpHop', {}).get('ports')
-        except (TypeError, ValueError):
-            raise RuntimeError(f'入站 {ident}: stream_settings 无效') from None
-        if not hop:
+            parsed = parse_inbound(ident, port, raw, listen)
+        except ValueError as e:
+            invalid[ident] = f'入站 {ident}: {e}'
             continue
-        m = re.fullmatch(r'\s*(\d+)\s*-\s*(\d+)\s*', str(hop))
-        if not m:
-            raise RuntimeError(f'入站 {ident}: Hop Ports 格式错误')
-        a, b = map(int, m.groups())
-        port = int(port)
-        if not (1 <= a <= b <= 65535 and 1 <= port <= 65535):
-            raise RuntimeError(f'入站 {ident}: 端口超出范围')
-        if a <= port <= b:
-            raise RuntimeError(f'入站 {ident}: Hop 范围包含监听端口')
-        if listen not in (None, '', '::', '0.0.0.0'):
-            raise RuntimeError(f'入站 {ident}: 暂不支持绑定指定 IP')
-        result.append(dict(id=ident, remark=remark or '', port=port, start=a, end=b))
-    return result
+        if parsed:
+            a, b, port = parsed
+            valid.append(dict(id=ident, remark=remark or '', port=port, start=a, end=b))
+    return valid, invalid
 
 
 def choose(ident=None):
-    options = inbounds()
+    options, invalid = inbounds()
     if ident is not None:
+        if ident in invalid:
+            raise RuntimeError(invalid[ident])
         match = next((x for x in options if x['id'] == ident), None)
         if not match:
             raise RuntimeError(f'未找到有效的 Hysteria2 UDP Hop 入站 ID={ident}')
         return match
+    for reason in invalid.values():
+        warn(reason + '（已跳过）')
     if not options:
+        if invalid:
+            raise RuntimeError('没有可用的 Hysteria2 Hop 入站：' + '; '.join(invalid.values()))
         raise RuntimeError('未找到启用且填写 Hop Ports 的 Hysteria2 入站，请先在 3X-UI 配置')
     if len(options) == 1:
         return options[0]
@@ -103,24 +183,44 @@ def choose(ident=None):
     return options[i - 1]
 
 
+# ---------------------------------------------------------------- packages
+
+def apt_install(packages):
+    cmd = ['apt-get', '-y', '-o', 'DPkg::Lock::Timeout=300', '--no-install-recommends', 'install'] + packages
+    if run(cmd, False).returncode == 0:
+        return
+    # Package lists may be missing (fresh image) or stale; apt-get update can also
+    # race with unattended-upgrades on first boot, so retry a few times.
+    for attempt in range(3):
+        if run(['apt-get', '-o', 'DPkg::Lock::Timeout=300', 'update'], False).returncode == 0:
+            break
+        time.sleep(10)
+    run(cmd)
+
+
 def dependency():
     if shutil.which('nft'):
         return
-    print('自动安装 nftables（不会启动系统 nftables.service）')
-    run(['apt-get', 'update'])
-    run(['apt-get', 'install', '-y', 'nftables'])
+    was_active = run(['systemctl', 'is-active', 'nftables.service'], False).stdout.strip() == 'active'
+    print('自动安装 nftables（不会启用系统 nftables.service）')
+    try:
+        apt_install(['nftables'])
+    except RuntimeError as e:
+        hint = ''
+        if 'installation candidate' in str(e) or 'Unable to locate' in str(e):
+            # Ubuntu 20.04 ships nftables in "universe", which some minimal images disable.
+            hint = '（Ubuntu 20.04 请先启用 universe 软件源：add-apt-repository universe 或在 sources.list 加入 universe）'
+        raise RuntimeError(f'nftables 安装失败{hint}: {e}') from None
     if not shutil.which('nft'):
         raise RuntimeError('nftables 安装失败')
+    if not was_active and run(['systemctl', 'is-active', 'nftables.service'], False).stdout.strip() == 'active':
+        warn('nftables.service 在安装后被启动，它会加载 /etc/nftables.conf；如 UFW/Docker 规则异常请执行 ufw reload 或重启 Docker')
 
 
-def families():
-    fam = ['ip']
-    p = run(['ip', '-6', '-o', 'addr', 'show', 'scope', 'global'], False)
-    if p.returncode:
-        raise RuntimeError('无法检测 IPv6 地址')
-    if p.stdout.strip():
-        fam.append('ip6')
-    return fam
+# ---------------------------------------------------------------- nftables
+
+def ipv6_available():
+    return Path('/proc/net/if_inet6').exists()
 
 
 def owned_tables():
@@ -130,15 +230,36 @@ def owned_tables():
 def rules(cfg, fams, present=()):
     lines = [f'delete table {f} {TABLE}' for f in present]
     for f in fams:
+        # fib daddr type local: only redirect packets addressed to this host, never
+        # forwarded traffic (Docker containers, WireGuard clients...) that happens to
+        # target a remote UDP port inside the hop range. priority -100 == dstnat,
+        # numeric for nftables < 0.9.1 compatibility.
         lines += [f'add table {f} {TABLE}',
-                  f'add chain {f} {TABLE} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}',
-                  f'add rule {f} {TABLE} prerouting udp dport {cfg["start"]}-{cfg["end"]} counter redirect to :{cfg["port"]}']
+                  f'add chain {f} {TABLE} prerouting {{ type nat hook prerouting priority -100; policy accept; }}',
+                  f'add rule {f} {TABLE} prerouting fib daddr type local udp dport {cfg["start"]}-{cfg["end"]} '
+                  f'counter redirect to :{cfg["port"]}']
     return '\n'.join(lines) + '\n'
+
+
+def families(cfg):
+    fam = ['ip']
+    if ipv6_available():
+        # Dry-run in the kernel: some VPS kernels/containers lack IPv6 NAT.
+        if run(['nft', '-c', '-f', '-'], False, rules(cfg, ['ip6'])).returncode == 0:
+            fam.append('ip6')
+        else:
+            warn('内核不支持 IPv6 NAT，仅创建 IPv4 规则')
+    return fam
 
 
 def apply(cfg, fams):
     # nft -f is a single kernel transaction, including delete + create.
-    run(['nft', '-f', '-'], input_text=rules(cfg, fams, owned_tables()))
+    try:
+        run(['nft', '-f', '-'], input_text=rules(cfg, fams, owned_tables()))
+    except RuntimeError as e:
+        kind = container_type()
+        hint = f'（当前为 {kind} 容器，宿主机可能不允许 nftables NAT，请换 KVM VPS）' if kind else ''
+        raise RuntimeError(f'nftables 规则写入失败{hint}: {e}') from None
 
 
 def delete_tables():
@@ -147,32 +268,134 @@ def delete_tables():
         run(['nft', '-f', '-'], input_text=rules({}, [], present))
 
 
-def listener(cfg):
-    p = run(['ss', '-H', '-lun'], False)
+# ---------------------------------------------------------------- port checks
+
+def udp_sockets():
+    """Return [(local_addr, port, raw_line)] for unconnected UDP sockets."""
+    p = run(['ss', '-H', '-lunp'], False)
+    if p.returncode:
+        p = run(['ss', '-H', '-lun'], False)
     if p.returncode:
         raise RuntimeError('无法检查 UDP 监听')
-    if not any(re.search(r':' + str(cfg['port']) + r'\s', line + ' ') for line in p.stdout.splitlines()):
-        raise RuntimeError(f'UDP {cfg["port"]} 未监听')
+    result = []
+    for line in p.stdout.splitlines():
+        t = line.split()
+        if t and t[0] in ('udp', 'udp6'):
+            t = t[1:]
+        if len(t) < 4:
+            continue
+        m = re.fullmatch(r'(.*):(\d+)', t[3])
+        if m:
+            result.append((m.group(1), int(m.group(2)), line.strip()))
+    return result
+
+
+def is_loopback(addr):
+    addr = addr.strip('[]').split('%')[0]
+    return addr.startswith('127.') or addr == '::1'
+
+
+def listener(cfg):
+    hits = [a for a, port, _ in udp_sockets() if port == cfg['port']]
+    if not hits:
+        raise RuntimeError(f'UDP {cfg["port"]} 未监听（3X-UI/Xray 是否在运行？）')
+    if all(is_loopback(a) for a in hits):
+        raise RuntimeError(f'UDP {cfg["port"]} 只监听在回环地址')
+
+
+def ephemeral_range():
+    try:
+        lo, hi = map(int, Path('/proc/sys/net/ipv4/ip_local_port_range').read_text().split())
+        return lo, hi
+    except (OSError, ValueError):
+        return 32768, 60999
+
+
+def port_spec_overlaps(text, start, end):
+    """True/False for an nft/iptables port expression, None if it can't be parsed."""
+    text = text.strip().strip('{}').replace(':', '-')
+    found = False
+    for part in re.split(r'[,\s]+', text):
+        if not part:
+            continue
+        m = re.fullmatch(r'(\d+)(?:-(\d+))?', part)
+        if not m:
+            return None
+        a = int(m.group(1))
+        b = int(m.group(2) or a)
+        found = True
+        if a <= end and b >= start:
+            return True
+    return False if found else None
+
+
+def nat_rule_conflicts(rule, start, end):
+    """Decide whether one NAT/TPROXY rule line can capture UDP in [start, end]."""
+    low = rule.lower()
+    udp_ports = re.findall(r'\b(?:udp|th) dport (\{[^}]*\}|\S+)', low)
+    udp_ports += re.findall(r'--dports? (\S+)', low) if re.search(r'-p udp\b', low) else []
+    if re.search(r'dport !=|! --dports?\b', low):
+        return True  # negated port match captures almost everything
+    if udp_ports:
+        verdicts = [port_spec_overlaps(x, start, end) for x in udp_ports]
+        return any(v is not False for v in verdicts)
+    if re.search(r'\btcp\b', low) and not re.search(r'\budp\b|\bth\b', low):
+        return False  # TCP-only port forward (typical Docker -p 8080:80)
+    return True  # generic redirect without a port filter
+
+
+def legacy_nat_rules():
+    """Rules in iptables-legacy nat/mangle tables (invisible to `nft list ruleset`).
+
+    Read only when the kernel already has those legacy tables loaded, so we never
+    autoload iptable_nat on nft-only systems."""
+    out = []
+    for names, tool in (('/proc/net/ip_tables_names', 'iptables-legacy-save'),
+                        ('/proc/net/ip6_tables_names', 'ip6tables-legacy-save')):
+        try:
+            loaded = Path(names).read_text().split()
+        except OSError:
+            continue
+        exe = shutil.which(tool)
+        if not exe:
+            continue
+        for table in ('nat', 'mangle'):
+            if table in loaded:
+                p = run([exe, '-t', table], False)
+                if p.returncode == 0:
+                    out += [l for l in p.stdout.splitlines() if l.startswith('-A ')]
+    return out
 
 
 def conflicts(cfg):
-    p = run(['ss', '-H', '-lun'], False)
-    if p.returncode:
-        raise RuntimeError('无法检查 UDP 端口占用')
-    for line in p.stdout.splitlines():
-        parts = line.split()
-        addr = parts[4] if len(parts) > 5 else (parts[3] if len(parts) > 3 else '')
-        m = re.search(r':(\d+)$', addr)
-        if m and cfg['start'] <= int(m.group(1)) <= cfg['end']:
+    lo, hi = ephemeral_range()
+    for addr, port, line in udp_sockets():
+        if cfg['start'] <= port <= cfg['end']:
+            if lo <= port <= hi:
+                # Unconnected outbound UDP sockets (DNS/QUIC clients) get random
+                # ephemeral ports; they show up in `ss -l` but are not services.
+                warn(f'跳跃范围内有临时端口 UDP 套接字，忽略: {line}')
+                continue
             raise RuntimeError(f'跳跃端口与 UDP 监听冲突: {line}')
-    p = run(['nft', '-a', 'list', 'ruleset'], False)
+    p = run(['nft', 'list', 'ruleset'], False)
     if p.returncode:
         raise RuntimeError('无法读取现有 nftables 规则')
-    # Conservative: avoid interfering with preexisting DNAT/redirect on host.
     other = re.sub(r'(?ms)^table (?:ip|ip6) ' + TABLE + r' \{.*?^\}\n?', '', p.stdout)
-    if re.search(r'\b(dnat|redirect)\b', other, re.I):
-        raise RuntimeError('检测到其他 NAT 重定向规则，为避免覆盖现有业务已停止（需要人工审查）')
+    candidates = [l.strip() for l in other.splitlines() if NAT_WORDS.search(l)]
+    candidates += [l for l in legacy_nat_rules() if re.search(r'-j (DNAT|REDIRECT|TPROXY)\b', l)]
+    for rule in candidates:
+        if nat_rule_conflicts(rule, cfg['start'], cfg['end']):
+            raise RuntimeError('检测到可能覆盖跳跃范围的其他 NAT/TPROXY 规则，为避免影响现有业务已停止'
+                               f'（需要人工审查）: {rule}')
 
+
+def check_ranges(cfg):
+    lo, hi = ephemeral_range()
+    if cfg['start'] <= hi and cfg['end'] >= lo:
+        warn(f'跳跃范围与系统临时端口 {lo}-{hi} 重叠，可正常使用；如追求稳定建议改为不重叠的范围（例如 20000-30000）')
+
+
+# ---------------------------------------------------------------- firewall
 
 def specs(cfg):
     """UFW specs this tool must own for a config: hop range, then listen port."""
@@ -207,12 +430,22 @@ def ufw_delete(spec):
         run(['ufw', '--force', 'delete', 'allow', spec])
 
 
+def other_firewall_hint(cfg):
+    if ufw_active():
+        return
+    if shutil.which('firewall-cmd') and run(['firewall-cmd', '--state'], False).returncode == 0:
+        warn(f'检测到 firewalld，本脚本不修改它，请自行放行 UDP {cfg["port"]} 与 {cfg["start"]}-{cfg["end"]}')
+
+
+# ---------------------------------------------------------------- state & service
+
 def read_state():
     return json.loads(STATE.read_text()) if STATE.exists() else None
 
 
 def write_state(state):
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state = dict(state, version=VERSION)
     fd, name = tempfile.mkstemp(prefix='.state-', dir=BASE)
     try:
         with os.fdopen(fd, 'w') as f:
@@ -227,20 +460,43 @@ def write_state(state):
 
 
 def unit_content():
-    return ('[Unit]\nDescription=HCloudLab Hysteria2 UDP Hop\nAfter=network-online.target ufw.service x-ui.service\n'
-            'Wants=network-online.target\n[Service]\nType=oneshot\nRemainAfterExit=yes\n'
-            f'ExecStart={SELF} reload\nExecStop={SELF} stop-rules\n'
-            '[Install]\nWantedBy=multi-user.target\n')
+    return ('[Unit]\n'
+            'Description=HCloudLab Hysteria2 UDP Hop\n'
+            'After=network-online.target nftables.service ufw.service firewalld.service x-ui.service\n'
+            'Wants=network-online.target\n'
+            # nftables.service (if the admin uses it) runs `flush ruleset` on
+            # start/restart/reload; follow it so the hop table comes back:
+            # stop/restart via PartOf, reload via ReloadPropagatedFrom, and a
+            # later start via WantedBy=nftables.service below.
+            'PartOf=nftables.service\n'
+            'ReloadPropagatedFrom=nftables.service\n'
+            '[Service]\n'
+            'Type=oneshot\n'
+            'RemainAfterExit=yes\n'
+            'Environment=PYTHONIOENCODING=utf-8\n'
+            f'ExecStart={SELF} reload\n'
+            f'ExecReload={SELF} reload\n'
+            f'ExecStop={SELF} stop-rules\n'
+            '[Install]\n'
+            'WantedBy=multi-user.target nftables.service\n')
 
 
 def setup_service():
+    """Install/refresh the CLI copy and unit; idempotent, so update() also upgrades old installs."""
     source = Path(__file__).resolve()
     if source != SELF.resolve():
-        shutil.copy2(source, SELF)
+        if not SELF.exists() or SELF.read_bytes() != source.read_bytes():
+            tmp = SELF.with_name('.' + SELF.name + '.new')
+            shutil.copyfile(source, tmp)
+            tmp.chmod(0o755)
+            os.replace(tmp, SELF)
     SELF.chmod(0o755)
-    UNIT.write_text(unit_content())
-    run(['systemctl', 'daemon-reload'])
-    run(['systemctl', 'enable', SERVICE])
+    content = unit_content()
+    if not UNIT.exists() or UNIT.read_text() != content:
+        UNIT.write_text(content)
+        run(['systemctl', 'daemon-reload'])
+    if run(['systemctl', 'is-enabled', SERVICE], False).stdout.strip() != 'enabled':
+        run(['systemctl', 'enable', SERVICE])
 
 
 def clean_service():
@@ -248,6 +504,8 @@ def clean_service():
     UNIT.unlink(missing_ok=True)
     run(['systemctl', 'daemon-reload'])
 
+
+# ---------------------------------------------------------------- actions
 
 def install(ident=None):
     if STATE.exists() or UNIT.exists():
@@ -258,7 +516,8 @@ def install(ident=None):
     if owned_tables():
         raise RuntimeError('发现没有状态记录的专属 nft 表，拒绝覆盖')
     conflicts(cfg)
-    fam = families()
+    check_ranges(cfg)
+    fam = families(cfg)
     hop_spec, port_spec = specs(cfg)
     added = []
     try:
@@ -281,7 +540,8 @@ def install(ident=None):
         else:
             print('回滚不完整，请保留状态文件并检查: ' + '; '.join(errors), file=sys.stderr)
         raise
-    print(f'安装完成: 入站 {cfg["id"]} UDP {cfg["start"]}-{cfg["end"]} → {cfg["port"]}')
+    other_firewall_hint(cfg)
+    print(f'安装完成: 入站 {cfg["id"]} UDP {cfg["start"]}-{cfg["end"]} → {cfg["port"]}（{"/".join(fam)}）')
     print('请更新客户端订阅并实测；云厂商安全组需自行允许跳跃范围及监听端口 UDP。')
 
 
@@ -293,10 +553,12 @@ def update(ident=None):
     listener(cfg)
     dependency()
     conflicts(cfg)
-    fam = families()
+    check_ranges(cfg)
+    fam = families(cfg)
     new_hop, new_port = specs(cfg)
     old_owned = list(old.get('ufw_owned', []))
-    unchanged = cfg == old['config'] and fam == old['families']
+    # Old versions created a rule without `fib daddr type local`: rebuild once.
+    unchanged = cfg == old['config'] and fam == old['families'] and old.get('version') == VERSION
     # Specs this tool owned before that neither new spec needs any more
     # (covers both a changed range/port and pre-fix state missing the port spec).
     stale = [s for s in old_owned if s not in (new_hop, new_port)]
@@ -310,6 +572,7 @@ def update(ident=None):
             ufw_delete(spec)
         raise
     if unchanged and not added and not stale:
+        setup_service()
         print('配置无变化')
         return
     owned = list(dict.fromkeys([s for s in old_owned if s in (new_hop, new_port)] + added))
@@ -338,7 +601,9 @@ def update(ident=None):
     if stale:
         transitional['ufw_owned'] = owned
         write_state(transitional)
-    print('更新完成:', cfg)
+    setup_service()
+    other_firewall_hint(cfg)
+    print(f'更新完成: 入站 {cfg["id"]} UDP {cfg["start"]}-{cfg["end"]} → {cfg["port"]}（{"/".join(fam)}）')
 
 
 def reload_rules():
@@ -362,7 +627,16 @@ def restore():
         ufw_delete(spec)
     clean_service()
     STATE.unlink()
+    with contextlib.suppress(OSError):
+        BASE.rmdir()
+    SELF.unlink(missing_ok=True)
     print('恢复完成：只清理本工具规则和服务；3X-UI 与 nftables 软件包保留')
+
+
+def counters(fam):
+    p = run(['nft', 'list', 'chain', fam, TABLE, 'prerouting'], False)
+    m = re.search(r'packets (\d+) bytes (\d+)', p.stdout)
+    return m.groups() if m else None
 
 
 def status():
@@ -373,8 +647,11 @@ def status():
     cfg = state['config']
     errors = []
     try:
-        current = next((x for x in inbounds() if x['id'] == cfg['id']), None)
-        if current != cfg:
+        valid, invalid = inbounds()
+        current = next((x for x in valid if x['id'] == cfg['id']), None)
+        if cfg['id'] in invalid:
+            errors.append(invalid[cfg['id']])
+        elif current != cfg:
             errors.append('3X-UI 入站配置已改变，请执行更新')
         listener(cfg)
     except Exception as e:
@@ -391,7 +668,11 @@ def status():
             errors.append('UFW 未显示跳跃端口范围放行规则')
         if not ufw_has(port_spec):
             errors.append('UFW 未显示监听端口放行规则')
-    print('配置:', cfg)
+    print(f'配置: 入站 {cfg["id"]} {cfg.get("remark", "")} UDP {cfg["start"]}-{cfg["end"]} → {cfg["port"]}')
+    for fam in state['families']:
+        c = counters(fam)
+        if c:
+            print(f'  {fam:<3} 已转发 {c[0]} 个数据包 / {c[1]} 字节')
     print('STATUS:', 'PASS' if not errors else 'FAIL')
     for error in errors:
         print(' -', error)
@@ -400,11 +681,14 @@ def status():
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description=f'HCloudLab Hysteria2 UDP Hop {VERSION}')
     p.add_argument('action', nargs='?', choices=['install', 'update', 'status', 'restore', 'reload', 'stop-rules'])
     p.add_argument('--inbound-id', type=int)
+    p.add_argument('--version', action='version', version=VERSION)
     args = p.parse_args()
-    prerequisites()
+    # reload/stop-rules run from systemd at boot: never refuse them just because
+    # the OS was upgraded to an untested release, or the node would go offline.
+    prerequisites(check_release=args.action not in ('reload', 'stop-rules'))
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     with LOCK.open('a+') as fd:
         try:
@@ -413,7 +697,7 @@ def main():
             raise RuntimeError('已有另一进程正在操作') from None
         action = args.action
         if action is None:
-            print('\nHCloudLab · Hysteria2 UDP Hop\n1. 一键安装\n2. 更新配置\n3. 状态检查\n4. 一键恢复\n5. 退出')
+            print(f'\nHCloudLab · Hysteria2 UDP Hop {VERSION}\n1. 一键安装\n2. 更新配置\n3. 状态检查\n4. 一键恢复\n5. 退出')
             action = {'1': 'install', '2': 'update', '3': 'status', '4': 'restore', '5': 'exit'}.get(input('请选择: ').strip())
         if action == 'install':
             install(args.inbound_id)
@@ -435,6 +719,9 @@ def main():
 if __name__ == '__main__':
     try:
         sys.exit(main())
+    except (EOFError, KeyboardInterrupt):
+        print('\n已取消', file=sys.stderr)
+        sys.exit(130)
     except (RuntimeError, OSError, ValueError, sqlite3.Error) as e:
         print('ERROR:', e, file=sys.stderr)
         sys.exit(1)
