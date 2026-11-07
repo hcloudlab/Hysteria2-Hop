@@ -7,6 +7,8 @@ HY2HOP_PATH = Path(__file__).resolve().parent.parent / 'hy2hop.py'
 spec = importlib.util.spec_from_file_location('hy2hop_ports', HY2HOP_PATH)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+# Never touch the real host from unit tests.
+m.setup_service = Mock(); m.other_firewall_hint = Mock(); m.legacy_nat_rules = lambda: []
 
 CFG = {'id': 5, 'remark': 'DMIT-Hy2-test', 'port': 443, 'start': 20000, 'end': 30000}
 NEW_CFG = {'id': 5, 'remark': 'DMIT-Hy2-test', 'port': 15447, 'start': 21000, 'end': 49000}
@@ -100,7 +102,7 @@ class PortOwnershipTests(unittest.TestCase):
         c.assert_called_once()
 
     def test_update_changes_port_and_range_cleans_up_old_owned(self):
-        old = {'config': CFG, 'families': ['ip'], 'ufw_owned': ['20000:30000/udp', '443/udp']}
+        old = {'config': CFG, 'families': ['ip'], 'version': m.VERSION, 'ufw_owned': ['20000:30000/udp', '443/udp']}
         with patch.object(m, 'read_state', return_value=old), patch.object(m, 'choose', return_value=NEW_CFG), \
              patch.object(m, 'listener'), patch.object(m, 'dependency'), patch.object(m, 'conflicts'), \
              patch.object(m, 'families', return_value=['ip']), patch.object(m, 'ufw_add', return_value=True) as ua, \
@@ -116,7 +118,7 @@ class PortOwnershipTests(unittest.TestCase):
 
     def test_update_backfills_missing_listen_port_rule_from_old_version_state(self):
         # Pre-fix installs only ever recorded ownership of the hop-range spec.
-        old = {'config': CFG, 'families': ['ip'], 'ufw_owned': ['20000:30000/udp']}
+        old = {'config': CFG, 'families': ['ip'], 'version': m.VERSION, 'ufw_owned': ['20000:30000/udp']}
         with patch.object(m, 'read_state', return_value=old), patch.object(m, 'choose', return_value=CFG), \
              patch.object(m, 'listener'), patch.object(m, 'dependency'), patch.object(m, 'conflicts'), \
              patch.object(m, 'families', return_value=['ip']), \
@@ -130,7 +132,7 @@ class PortOwnershipTests(unittest.TestCase):
         self.assertEqual(sorted(w.call_args.args[0]['ufw_owned']), ['20000:30000/udp', '443/udp'])
 
     def test_update_idempotent_when_fully_owned_and_unchanged(self):
-        old = {'config': CFG, 'families': ['ip'], 'ufw_owned': ['20000:30000/udp', '443/udp']}
+        old = {'config': CFG, 'families': ['ip'], 'version': m.VERSION, 'ufw_owned': ['20000:30000/udp', '443/udp']}
         with patch.object(m, 'read_state', return_value=old), patch.object(m, 'choose', return_value=CFG), \
              patch.object(m, 'listener'), patch.object(m, 'dependency'), patch.object(m, 'conflicts'), \
              patch.object(m, 'families', return_value=['ip']), patch.object(m, 'ufw_add') as ua, \
@@ -164,7 +166,7 @@ class PortOwnershipTests(unittest.TestCase):
                 return Mock(returncode=0, stdout='ufw allow 20000:30000/udp\n')  # listen port missing
             return Mock(returncode=0, stdout='')
 
-        with patch.object(m, 'read_state', return_value=state), patch.object(m, 'inbounds', return_value=[CFG]), \
+        with patch.object(m, 'read_state', return_value=state), patch.object(m, 'inbounds', return_value=([CFG], {})), \
              patch.object(m, 'listener'), patch.object(m.shutil, 'which', return_value='/usr/sbin/ufw'), \
              patch.object(m, 'run', side_effect=fake_run):
             rc = m.status()
@@ -184,7 +186,7 @@ class PortOwnershipTests(unittest.TestCase):
                 return Mock(returncode=0, stdout='ufw allow 20000:30000/udp\nufw allow 443/udp\n')
             return Mock(returncode=0, stdout='')
 
-        with patch.object(m, 'read_state', return_value=state), patch.object(m, 'inbounds', return_value=[CFG]), \
+        with patch.object(m, 'read_state', return_value=state), patch.object(m, 'inbounds', return_value=([CFG], {})), \
              patch.object(m, 'listener'), patch.object(m.shutil, 'which', return_value='/usr/sbin/ufw'), \
              patch.object(m, 'run', side_effect=fake_run):
             rc = m.status()
@@ -202,13 +204,13 @@ class PortOwnershipTests(unittest.TestCase):
                 return Mock(returncode=0, stdout='Status: inactive\n')
             return Mock(returncode=0, stdout='')
 
-        with patch.object(m, 'read_state', return_value=state), patch.object(m, 'inbounds', return_value=[CFG]), \
+        with patch.object(m, 'read_state', return_value=state), patch.object(m, 'inbounds', return_value=([CFG], {})), \
              patch.object(m, 'listener'), patch.object(m, 'run', side_effect=fake_run):
             rc = m.status()
         self.assertEqual(rc, 0)
 
     def test_update_nat_apply_failure_rolls_back_ufw_and_nft(self):
-        old = {'config': CFG, 'families': ['ip'], 'ufw_owned': ['20000:30000/udp', '443/udp']}
+        old = {'config': CFG, 'families': ['ip'], 'version': m.VERSION, 'ufw_owned': ['20000:30000/udp', '443/udp']}
         with patch.object(m, 'read_state', return_value=old), patch.object(m, 'choose', return_value=NEW_CFG), \
              patch.object(m, 'listener'), patch.object(m, 'dependency'), patch.object(m, 'conflicts'), \
              patch.object(m, 'families', return_value=['ip']), patch.object(m, 'ufw_add', return_value=True), \

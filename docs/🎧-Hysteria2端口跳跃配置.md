@@ -1,6 +1,6 @@
 # 🎧 3X-UI Hysteria2 端口跳跃配置教程
 
-适用：Ubuntu 24.04、3X-UI、Hysteria2。
+适用：Debian 11/12/13、Ubuntu 20.04/22.04/24.04/26.04、3X-UI、Hysteria2。
 端口跳跃需要三件事同时生效，少一件客户端就连不上：
 
 1. 一段"跳跃端口范围"（比如 `20000-30000`）的 UDP 流量，被转发到 Hysteria2 真正监听的那个端口（比如 `443`）。
@@ -128,7 +128,7 @@ sudo bash install.sh
 脚本只读 3X-UI 数据库，根据入站的监听端口和 Hop Ports 配置 nftables UDP 转发、UFW 规则和 systemd 启动恢复，具体会自动做这几件事：
 
 - 读取 3X-UI 数据库里 Hysteria2 的监听端口和 Hop Ports（只读，不会改 3X-UI 的数据库）。
-- 如果没装 nftables，自动用 `apt-get` 装上。
+- 如果没装 nftables，自动用 `apt-get` 装上（Ubuntu 20.04 需先启用 universe 软件源）。
 - 生成跳跃端口范围 → 监听端口的 NAT 转发规则。
 - **如果 UFW 是开着的**：自动放行跳跃范围和监听端口这两条 UDP 规则，已经存在的规则不会重复添加。
 - **如果 UFW 没开**：脚本不会帮你打开 UFW，也不会因为这个报错——它假定你清楚自己在做什么。

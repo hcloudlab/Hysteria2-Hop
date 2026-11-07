@@ -18,9 +18,16 @@ class SupportedOsTests(unittest.TestCase):
     def test_debian_13(self):
         self.assertTrue(module.supported_os('ID=debian\nVERSION_ID=13\n'))
 
+    def test_v2_matrix(self):
+        for data in ('ID=debian\nVERSION_ID=11\n', 'ID=ubuntu\nVERSION_ID=20.04\n',
+                     'ID=ubuntu\nVERSION_ID="22.04"\n', 'ID=ubuntu\nVERSION_ID="26.04"\n'):
+            with self.subTest(data=data):
+                self.assertTrue(module.supported_os(data))
+
     def test_reject_unsupported(self):
-        for data in ('ID=debian\nVERSION_ID=11\n',
-                     'ID=ubuntu\nVERSION_ID=22.04\n',
+        for data in ('ID=debian\nVERSION_ID=10\n',
+                     'ID=ubuntu\nVERSION_ID=18.04\n',
+                     'ID=ubuntu\nVERSION_ID=24.10\n',
                      'ID=linuxmint\nID_LIKE=ubuntu\nVERSION_ID=24.04\n',
                      'ID=debian\n',
                      'ID=debian\nVERSION_ID=12.1\n'):

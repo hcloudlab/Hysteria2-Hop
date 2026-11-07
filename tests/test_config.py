@@ -1,10 +1,12 @@
 import importlib.util, json, sqlite3, tempfile, unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 HY2HOP_PATH = Path(__file__).resolve().parent.parent / 'hy2hop.py'
 spec=importlib.util.spec_from_file_location('hy2hop',HY2HOP_PATH)
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+# Never touch the real host from unit tests.
+m.setup_service = Mock(); m.other_firewall_hint = Mock(); m.legacy_nat_rules = lambda: []
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
